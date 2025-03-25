@@ -27,8 +27,8 @@ def get_device(module):
 # Solver assumes standardized input
 class IndexedTensorDataset(TensorDataset):
     def __getitem__(self, index):
-        val = super(IndexedTensorDataset, self).__getitem__(index)
-        return val + (index,)
+        val = super().__getitem__(index)
+        return (*val, index)
 
 
 class IndexedDataset(Dataset):
@@ -40,31 +40,12 @@ class IndexedDataset(Dataset):
     def __getitem__(self, index):
         val = self.dataset[index]
         if self.sample_weight is None:
-            return val + (index,)
+            return (*val, index)
         weight = self.sample_weight[index]
-        return val + (weight, index)
+        return (*val, weight, index)
 
     def __len__(self):
         return len(self.dataset)
-
-
-# create a new dataloader which returns example indices
-def add_index_to_dataloader(loader, sample_weight=None):
-    return DataLoader(
-        IndexedDataset(loader.dataset, sample_weight=sample_weight),
-        batch_size=loader.batch_size,
-        sampler=loader.sampler,
-        # batch_sampler=loader.batch_sampler,
-        num_workers=loader.num_workers,
-        collate_fn=loader.collate_fn,
-        pin_memory=loader.pin_memory,
-        drop_last=loader.drop_last,
-        timeout=loader.timeout,
-        worker_init_fn=loader.worker_init_fn,
-        multiprocessing_context=loader.multiprocessing_context,
-        # generator=loader.generator
-    )
-
 
 # L1 regularization
 # proximal operator for f(\beta) = lam * \|\beta\|_1
@@ -95,52 +76,12 @@ def group_threshold_with_shrinkage(x, alpha, beta):
     return y / (1 + beta)
 
 
-# Elastic net loss
-def elastic_loss(linear, X, y, lam, alpha, family="multinomial", sample_weight=None):
-    weight, bias = list(linear.parameters())
-    l1 = lam * alpha * weight.norm(p=1)
-    l2 = 0.5 * lam * (1 - alpha) * (weight**2).sum()
-    if family == "multinomial":
-        if sample_weight is None:
-            l = F.cross_entropy(linear(X), y, reduction="mean")
-        else:
-            l = F.cross_entropy(linear(X), y, reduction="none")
-            l = (l * sample_weight).mean()
-    elif family == "gaussian":
-        # For some reason, PyTorch mse_loss doesn't take a weight argument
-        if sample_weight is None:
-            l = 0.5 * F.mse_loss(linear(X), y, reduction="mean")
-        else:
-            l = 0.5 * F.mse_loss(linear(X), y, reduction="none")
-            l = (l * (sample_weight.unsqueeze(1))).mean()
-    else:
-        raise ValueError(f"Unknown family: {family}")
-    return l + l1 + l2
-
-
-# Elastic net loss given a loader instead
-def elastic_loss_loader(linear, loader, lam, alpha, preprocess=None, family="multinomial"):
-    loss = 0
-    n = 0
-    device = linear.weight.device
-    if preprocess is not None:
-        preprocess_device = get_device(preprocess)
-    for batch in loader:
-        X, y = batch[0].to(device), batch[1].to(device)
-        if preprocess is not None:
-            X = preprocess(X)
-        bs = X.size(0)
-        loss += elastic_loss(linear, X, y, lam, alpha, family=family) * bs
-        n += bs
-    return loss / n
-
-
 # Elastic net loss and accuracy
-def elastic_loss_and_acc(linear, X, y, lam, alpha, family="multinomial"):
+def elastic_loss_and_acc(linear, inputs, y, lam, alpha, family="multinomial"):
     weight, bias = list(linear.parameters())
     l1 = lam * alpha * weight.norm(p=1)
     l2 = 0.5 * lam * (1 - alpha) * (weight**2).sum()
-    outputs = linear(X)
+    outputs = linear(inputs)
     if family == "multinomial":
         l = F.cross_entropy(outputs, y, reduction="mean")
         acc = (outputs.max(1)[1] == y).float().mean()
@@ -160,14 +101,12 @@ def elastic_loss_and_acc_loader(linear, loader, lam, alpha, preprocess=None, fam
     acc = 0
     n = 0
     device = linear.weight.device
-    if preprocess is not None:
-        preprocess_device = get_device(preprocess)
     for batch in loader:
-        X, y = batch[0].to(device), batch[1].to(device)
+        inputs, y = batch[0].to(device), batch[1].to(device)
         if preprocess is not None:
-            X = preprocess(X)
-        bs = X.size(0)
-        l, a = elastic_loss_and_acc(linear, X, y, lam, alpha, family=family)
+            inputs = preprocess(inputs)
+        bs = inputs.size(0)
+        l, a = elastic_loss_and_acc(linear, inputs, y, lam, alpha, family=family)
         loss += l * bs
         acc += a * bs
         n += bs
@@ -175,13 +114,13 @@ def elastic_loss_and_acc_loader(linear, loader, lam, alpha, preprocess=None, fam
 
 
 # Train an elastic GLM with proximal gradient as a baseline
-def train(linear, X, y, lr, niters, lam, alpha, group=True, verbose=None):
+def train(linear, inputs, y, lr, niters, lam, alpha, group=True, verbose=None):
     weight, bias = list(linear.parameters())
 
     opt = SGD(linear.parameters(), lr=lr)
     for i in range(niters):
         with torch.enable_grad():
-            out = linear(X)
+            out = linear(inputs)
             loss = F.cross_entropy(out, y, reduction="mean") + 0.5 * lam * (1 - alpha) * (weight**2).sum()
             if verbose and (i % verbose) == 0:
                 print(loss.item())
@@ -196,72 +135,6 @@ def train(linear, X, y, lr, niters, lam, alpha, group=True, verbose=None):
             weight.data = group_threshold(weight, lr * lam * alpha)
         else:
             weight.data = soft_threshold(weight, lr * lam * alpha)
-
-
-# Train an elastic GLM with stochastic proximal gradient as an even more inaccurate baseline
-def train_spg(
-    linear,
-    loader,
-    max_lr,
-    nepochs,
-    lam,
-    alpha,
-    preprocess=None,
-    min_lr=1e-4,
-    group=True,
-    verbose=None,
-):
-    weight, bias = list(linear.parameters())
-
-    params = [weight, bias]
-    proximal = [True, False]
-
-    device = linear.weight.device
-
-    lrs = torch.logspace(math.log10(max_lr), math.log10(min_lr), nepochs).to(device)
-
-    for t in range(nepochs):
-        lr = lrs[t]
-        total_loss = 0
-        n_ex = 0
-        for X, y, idx in loader:
-            X, y = X.to(device), y.to(device)
-            if preprocess is not None:
-                with torch.no_grad():
-                    X = preprocess(X)
-            with torch.enable_grad():
-                out = linear(X)
-                # rescaling = X.size(0) / n_ex
-                loss = F.cross_entropy(out, y, reduction="mean") + 0.5 * lam * (1 - alpha) * (weight**2).sum()
-                # loss = F.cross_entropy(out,y, reduction='sum') + 0.5 * lam * (1 - alpha) * (weight**2).sum()
-                # print(out.requires_grad, linear.weight.requires_grad)
-                loss.backward()
-
-            with torch.no_grad():
-                total_loss += loss.item() * X.size(0)
-                n_ex += X.size(0)
-                for p, prox in zip(params, proximal, strict=False):
-                    # grad = p.grad / X.size(0) * n_ex
-                    grad = p.grad
-
-                    # take a step
-                    p.data = p.data - lr * grad
-                    if prox:
-                        if group:
-                            p.data = group_threshold(p, lr * lam * alpha)
-                        else:
-                            p.data = soft_threshold(p, lr * lam * alpha)
-
-            # clean up
-            weight.grad.zero_()
-            bias.grad.zero_()
-
-        if verbose and (t % verbose) == 0:
-            spg_obj = (total_loss / n_ex + lam * alpha * weight.norm(p=1)).item()
-            nnz = (weight.abs() > 1e-5).sum().item()
-            total = weight.numel()
-            print(f"obj {spg_obj} weight nnz {nnz}/{total} ({nnz / total:.4f}) ")
-            # print(f"obj {spg_obj} weight nnz {nnz}/{total} ({nnz/total:.4f}) criteria {criteria:.4f} {dw} {db}")
 
 
 # Train an elastic GLM with proximal SAGA
@@ -324,10 +197,10 @@ def train_saga(
             total_loss = 0
             for batch in loader:
                 if len(batch) == 3:
-                    X, y, idx = batch
+                    inputs, y, idx = batch
                     w = None
                 elif len(batch) == 4:
-                    X, y, w, idx = batch
+                    inputs, y, w, idx = batch
                 else:
                     raise ValueError(
                         f"Loader must return (data, target, index) or (data, target, index, weight) but instead got a tuple of length {len(batch)}"
@@ -336,9 +209,9 @@ def train_saga(
                 if preprocess is not None:
                     device = get_device(preprocess)
                     with torch.no_grad():
-                        X = preprocess(X.to(device))
-                X = X.to(weight.device)
-                out = linear(X)
+                        inputs = preprocess(inputs.to(device))
+                inputs = inputs.to(weight.device)
+                out = linear(inputs)
 
                 # split gradient on only the cross entropy term
                 # for efficient storage of gradient information
@@ -352,7 +225,7 @@ def train_saga(
                     target = I[y].to(weight.device)  # change to OHE
 
                     # Calculate new scalar gradient
-                    logits = F.softmax(linear(X))
+                    logits = F.softmax(linear(inputs))
                 elif family == "gaussian":
                     if w is None:
                         loss = 0.5 * F.mse_loss(out, y.to(weight.device), reduction="mean")
@@ -362,10 +235,10 @@ def train_saga(
                     target = y
 
                     # Calculate new scalar gradient
-                    logits = linear(X)
+                    logits = linear(inputs)
                 else:
                     raise ValueError(f"Unknown family: {family}")
-                total_loss += loss.item() * X.size(0)
+                total_loss += loss.item() * inputs.size(0)
 
                 # BS x NUM_CLASSES
                 a = logits - target
@@ -374,8 +247,8 @@ def train_saga(
                 a_prev = a_table[idx].to(weight.device)
 
                 # weight parameter
-                w_grad = (a.unsqueeze(2) * X.unsqueeze(1)).mean(0)
-                w_grad_prev = (a_prev.unsqueeze(2) * X.unsqueeze(1)).mean(0)
+                w_grad = (a.unsqueeze(2) * inputs.unsqueeze(1)).mean(0)
+                w_grad_prev = (a_prev.unsqueeze(2) * inputs.unsqueeze(1)).mean(0)
                 w_saga = w_grad - w_grad_prev + w_grad_avg
                 weight_new = weight - lr * w_saga
 
@@ -402,8 +275,8 @@ def train_saga(
 
                 # update table and averages
                 a_table[idx] = a.to(table_device)
-                w_grad_avg.add_((w_grad - w_grad_prev) * X.size(0) / n_ex)
-                b_grad_avg.add_((b_grad - b_grad_prev) * X.size(0) / n_ex)
+                w_grad_avg.add_((w_grad - w_grad_prev) * inputs.size(0) / n_ex)
+                b_grad_avg.add_((b_grad - b_grad_prev) * inputs.size(0) / n_ex)
 
                 if lookbehind is None:
                     dw = (weight_new - weight).norm(p=2)
@@ -461,29 +334,6 @@ def train_saga(
         }
 
 
-# Calculate the smallest regularization parameter which results in a
-# linear model with all zero weights. Calculation comes from the
-# coordinate descent iteration.
-def maximum_reg(X, y, group=True, family="multinomial"):
-    if family == "multinomial":
-        target = torch.eye(y.max() + 1)[y].to(y.device)
-    elif family == "gaussian":
-        target = y
-    else:
-        raise ValueError(f"Unknown family {family}")
-
-    y_bar = target.mean(0)
-    y_std = target.std(0)
-
-    y_map = target - y_bar
-
-    inner_products = X.t().mm(y_map)
-
-    if group:
-        inner_products = inner_products.norm(p=2, dim=1)
-    return inner_products.abs().max().item() / X.size(0)
-
-
 # Same as before, but for a loader instead
 def maximum_reg_loader(loader, group=True, preprocess=None, metadata=None, family="multinomial"):
     if metadata is not None:
@@ -534,12 +384,9 @@ def maximum_reg_loader(loader, group=True, preprocess=None, metadata=None, famil
 
     # calculate maximum regularization
     inner_products = 0
-    if preprocess is not None:
-        device = get_device(preprocess)
-    else:
-        device = y.device
+    device = get_device(preprocess) if preprocess is not None else y.device
     for batch in loader:
-        X, y = batch[0], batch[1]
+        inputs, y = batch[0], batch[1]
 
         if family == "multinomial":
             target = eye[y]
@@ -551,10 +398,10 @@ def maximum_reg_loader(loader, group=True, preprocess=None, metadata=None, famil
         y_map = target - y_bar
 
         if preprocess is not None:
-            X = preprocess(X.to(device))
+            inputs = preprocess(inputs.to(device))
             y_map = y_map.to(device)
             y_std = y_std.to(device)
-        inner_products += X.t().mm(y_map)
+        inner_products += inputs.t().mm(y_map)
 
     if group:
         inner_products = inner_products.norm(p=2, dim=1)
@@ -603,7 +450,7 @@ def glm_saga(
 
     if metadata is not None:
         if n_ex is None:
-            n_ex = metadata["X"]["num_examples"]
+            n_ex = metadata["inputs"]["num_examples"]
         if n_classes is None:
             n_classes = metadata["y"]["num_classes"]
 
@@ -738,7 +585,7 @@ class NormalizedRepresentation(nn.Module):
         metadata=None,
         device="cuda",
     ):
-        super(NormalizedRepresentation, self).__init__()
+        super().__init__()
 
         self.model = model
         if model is not None:
@@ -746,8 +593,8 @@ class NormalizedRepresentation(nn.Module):
         self.device = device
 
         if metadata is not None:
-            X_bar = metadata["X"]["mean"]
-            X_std = metadata["X"]["std"]
+            X_bar = metadata["inputs"]["mean"]
+            X_std = metadata["inputs"]["std"]
         else:
             if mean is None:
                 # calculate mean
@@ -758,29 +605,28 @@ class NormalizedRepresentation(nn.Module):
                     it = tqdm(it, total=len(loader))
 
                 for _, batch in it:
-                    X = batch[0]
+                    inputs = batch[0]
                     if model is not None:
-                        X = model(X.to(device))
+                        inputs = model(inputs.to(device))
 
-                    X_bar += X.sum(0)
-                    n += X.size(0)
+                    X_bar += inputs.sum(0)
+                    n += inputs.size(0)
 
                 X_bar = X_bar.float() / n
             else:
                 X_bar = mean
 
             if std is None:
-                # calculate std
                 X_std = 0
                 it = enumerate(loader)
                 if do_tqdm:
                     it = tqdm(it, total=len(loader))
 
                 for _, batch in it:
-                    X = batch[0]
+                    inputs = batch[0]
                     if model is not None:
-                        X = model(X.to(device))
-                    X_std += ((X - X_bar) ** 2).sum(0)
+                        inputs = model(inputs.to(device))
+                    X_std += ((inputs - X_bar) ** 2).sum(0)
                 X_std = torch.sqrt(X_std / (n - 1))
             else:
                 X_std = std
@@ -788,28 +634,26 @@ class NormalizedRepresentation(nn.Module):
         self.mu = X_bar
         self.sigma = X_std
 
-    def forward(self, X):
+    def forward(self, inputs):
         if self.model is not None:
             device = get_device(self.model)
-            X = self.model(X.to(device))
-        return (X - self.mu.to(self.device)) / self.sigma.to(self.device)
+            inputs = self.model(inputs.to(device))
+        return (inputs - self.mu.to(self.device)) / self.sigma.to(self.device)
 
 
 ## Wrapper for GLM Code (for LIME)
-
-
 class GLM:
     def __init__(
         self,
-        batch_size=128,
-        val_frac=0.1,
-        lr=0.1,
-        max_epochs=2000,
-        alpha=1,
-        verbose=200,
-        group=False,
-        lam_factor=0.001,
-        tol=1e-4,
+        batch_size: int = 128,
+        val_frac: float = 0.1,
+        lr: float = 0.1,
+        max_epochs: int = 2000,
+        alpha: float = 1,
+        verbose: int = 200,
+        group: bool = False,
+        lam_factor: float = 0.001,
+        tol: float = 1e-4,
     ):
         self.batch_size = batch_size
         self.val_frac = val_frac
@@ -821,14 +665,12 @@ class GLM:
         self.lam_factor = lam_factor
         self.tol = tol
 
-    def fit(self, X, Y, sample_weight=None):
-        val_sz = math.floor(X.size(0) * self.val_frac)
-        indices = torch.randperm(X.size(0))
+    def fit(self, inputs: torch.Tensor, labels: torch.Tensor):
+        val_sz = math.floor(inputs.size(0) * self.val_frac)
+        indices = torch.randperm(inputs.size(0))
 
-        X_val, X_tr = X[indices[:val_sz]], X[indices[val_sz:]]
-        y_val, y_tr = Y[indices[:val_sz]], Y[indices[val_sz:]]
-
-        # Add sample weight
+        X_val, X_tr = inputs[indices[:val_sz]], inputs[indices[val_sz:]]
+        y_val, y_tr = labels[indices[:val_sz]], labels[indices[val_sz:]]
 
         ds_tr = IndexedTensorDataset(X_tr, y_tr)
         ds_val = TensorDataset(X_val, y_val)
@@ -837,8 +679,8 @@ class GLM:
 
         print("Initializing linear model...")
         self.linear = nn.Linear(X_tr.size(1), y_tr.size[1]).cuda()
-        weight = linear.weight
-        bias = linear.bias
+        weight = self.linear.weight
+        bias = self.linear.bias
 
         for p in [weight, bias]:
             p.data.zero_()
@@ -850,7 +692,7 @@ class GLM:
             self.lr,
             self.max_epochs,
             self.alpha,
-            n_classes=Y.shape[1],
+            n_classes=labels.shape[1],
             checkpoint=None,
             verbose=self.verbose,
             tol=self.tol,
@@ -859,14 +701,8 @@ class GLM:
             val_loader=ld_val,
         )
 
-        # Figure out how to apply params
-
     def get_params(self, deep=True):
         return {"weight": self.linear.weight, "bias": self.linear.bias}
 
-    def predict(self, X):
-        return self.linear(X)
-
-    def score(self, X, y, sample_weight=None):
-        y_pred = self.linear(X).detach().cpu().numpy()
-        return r2_score(y, y_pred, sample_weight=sample_weight)
+    def predict(self, inputs):
+        return self.linear(inputs)
