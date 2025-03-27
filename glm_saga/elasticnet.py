@@ -145,7 +145,7 @@ def train_saga(
     linear,
     loader,
     lr,
-    nepochs,
+    num_epochs,
     lam,
     alpha,
     group=True,
@@ -153,7 +153,7 @@ def train_saga(
     state=None,
     table_device=None,
     n_ex=None,
-    n_classes=None,
+    num_classes=None,
     tol=1e-4,
     preprocess=None,
     lookbehind=None,
@@ -171,18 +171,18 @@ def train_saga(
         # for computing the gradients
         if n_ex is None:
             n_ex = sum(tensors[0].size(0) for tensors in loader)
-        if n_classes is None:
+        if num_classes is None:
             if family == "multinomial":
-                n_classes = max(tensors[1].max().item() for tensors in loader) + 1
+                num_classes = max(tensors[1].max().item() for tensors in loader) + 1
             elif family == "gaussian":
                 for batch in loader:
                     y = batch[1]
                     break
-                n_classes = y.size(1)
+                num_classes = y.size(1)
 
         # Storage for scalar gradients and averages
         if state is None:
-            a_table = torch.zeros(n_ex, n_classes).to(table_device)
+            a_table = torch.zeros(n_ex, num_classes).to(table_device)
             w_grad_avg = torch.zeros_like(weight).to(weight.device)
             b_grad_avg = torch.zeros_like(bias).to(weight.device)
         else:
@@ -193,7 +193,7 @@ def train_saga(
         obj_history = []
         obj_best = None
         nni = 0
-        for t in range(nepochs):
+        for t in range(num_epochs):
             total_loss = 0
             for batch in loader:
                 if len(batch) == 3:
@@ -225,7 +225,7 @@ def train_saga(
                     target = I[y].to(weight.device)  # change to OHE
 
                     # Calculate new scalar gradient
-                    logits = F.softmax(linear(inputs))
+                    logits = F.softmax(linear(inputs), -1)
                 elif family == "gaussian":
                     if w is None:
                         loss = 0.5 * F.mse_loss(out, y.to(weight.device), reduction="mean")
@@ -311,7 +311,7 @@ def train_saga(
             if verbose and (t % verbose) == 0:
                 if lookbehind is None:
                     logger(
-                        f"obj {saga_obj.item()} weight nnz {nnz}/{total} ({nnz / total:.4f}) criteria {criteria:.4f} {dw} {db}"
+                        f"obj {saga_obj.item()} weight nnz {nnz}/{total} ({nnz / total:.4f}) criteria {criteria:.4f} {dw:.6f} {db:.6f}"
                     )
                 else:
                     logger(f"obj {saga_obj.item()} weight nnz {nnz}/{total} ({nnz / total:.4f}) obj_best {obj_best}")
@@ -326,7 +326,7 @@ def train_saga(
                     "b_grad_avg": b_grad_avg.cpu(),
                 }
 
-        logger(f"did not converge at {nepochs} iterations (criteria {criteria})")
+        logger(f"did not converge at {num_epochs} iterations (criteria {criteria})")
         return {
             "a_table": a_table.cpu(),
             "w_grad_avg": w_grad_avg.cpu(),
@@ -414,7 +414,7 @@ def glm_saga(
     linear,
     loader,
     max_lr,
-    nepochs,
+    num_epochs,
     alpha,
     table_device=None,
     preprocess=None,
@@ -422,7 +422,7 @@ def glm_saga(
     verbose=None,
     state=None,
     n_ex=None,
-    n_classes=None,
+    num_classes=None,
     tol=1e-4,
     epsilon=0.001,
     k=100,
@@ -435,6 +435,7 @@ def glm_saga(
     lookbehind=None,
     family="multinomial",
     encoder=None,
+    max_sparsity=None,
 ):
     if encoder is not None:
         warnings.warn(
@@ -451,8 +452,8 @@ def glm_saga(
     if metadata is not None:
         if n_ex is None:
             n_ex = metadata["inputs"]["num_examples"]
-        if n_classes is None:
-            n_classes = metadata["y"]["num_classes"]
+        if num_classes is None:
+            num_classes = metadata["y"]["num_classes"]
 
     max_lam = maximum_reg_loader(loader, group=group, preprocess=preprocess, metadata=metadata, family=family) / max(
         0.001, alpha
@@ -493,7 +494,7 @@ def glm_saga(
             linear,
             loader,
             lr,
-            nepochs,
+            num_epochs,
             lam,
             alpha,
             table_device=table_device,
@@ -502,7 +503,7 @@ def glm_saga(
             verbose=verbose,
             state=state,
             n_ex=n_ex,
-            n_classes=n_classes,
+            num_classes=num_classes,
             tol=tol,
             lookbehind=lookbehind,
             family=family,
@@ -567,6 +568,8 @@ def glm_saga(
 
             if checkpoint is not None:
                 torch.save(params, os.path.join(checkpoint, f"params{i}.pth"))
+            if max_sparsity is not None and nnz/total > max_sparsity:
+                break
     return {"path": path, "best": best_params, "state": state}
 
 
@@ -641,20 +644,24 @@ class NormalizedRepresentation(nn.Module):
         return (inputs - self.mu.to(self.device)) / self.sigma.to(self.device)
 
 
-## Wrapper for GLM Code (for LIME)
 class GLM:
     def __init__(
         self,
+        num_classes: int,
         batch_size: int = 128,
         val_frac: float = 0.1,
         lr: float = 0.1,
+        k: int = 100,
         max_epochs: int = 2000,
         alpha: float = 1,
         verbose: int = 200,
         group: bool = False,
-        lam_factor: float = 0.001,
+        do_zero: bool = True,
+        epsilon: float = 0.001,
         tol: float = 1e-4,
+        max_sparsity: float | None = None
     ):
+        self.num_classes = num_classes
         self.batch_size = batch_size
         self.val_frac = val_frac
         self.lr = lr
@@ -662,12 +669,16 @@ class GLM:
         self.alpha = alpha
         self.verbose = verbose
         self.group = group
-        self.lam_factor = lam_factor
+        self.epsilon = epsilon
         self.tol = tol
 
+        self.k = k
+        self.do_zero = do_zero
+        self.max_sparsity = max_sparsity
+
     def fit(self, inputs: torch.Tensor, labels: torch.Tensor):
-        val_sz = math.floor(inputs.size(0) * self.val_frac)
-        indices = torch.randperm(inputs.size(0))
+        val_sz = math.floor(inputs.shape[0] * self.val_frac)
+        indices = torch.randperm(inputs.shape[0])
 
         X_val, X_tr = inputs[indices[:val_sz]], inputs[indices[val_sz:]]
         y_val, y_tr = labels[indices[:val_sz]], labels[indices[val_sz:]]
@@ -678,7 +689,7 @@ class GLM:
         ld_val = DataLoader(ds_val, batch_size=self.batch_size, shuffle=True)
 
         print("Initializing linear model...")
-        self.linear = nn.Linear(X_tr.size(1), y_tr.size[1]).cuda()
+        self.linear = nn.Linear(X_tr.shape[1], self.num_classes).cuda()
         weight = self.linear.weight
         bias = self.linear.bias
 
@@ -687,22 +698,26 @@ class GLM:
 
         print("Calculating the regularization path")
         self.params = glm_saga(
-            self.linear,
-            ld_tr,
-            self.lr,
-            self.max_epochs,
-            self.alpha,
-            n_classes=labels.shape[1],
+            linear = self.linear,
+            loader= ld_tr,
+            max_lr = self.lr,
+            num_epochs=self.max_epochs,
+            alpha=self.alpha,
+            k = self.k,
+            do_zero=self.do_zero,
+            num_classes=self.num_classes,
             checkpoint=None,
             verbose=self.verbose,
             tol=self.tol,
             group=self.group,
-            epsilon=self.lam_factor,
+            epsilon=self.epsilon,
             val_loader=ld_val,
+            max_sparsity=self.max_sparsity
         )
 
-    def get_params(self, deep=True):
+    def get_params(self):
         return {"weight": self.linear.weight, "bias": self.linear.bias}
 
+    @torch.no_grad
     def predict(self, inputs):
-        return self.linear(inputs)
+        return self.linear(inputs.cuda()).cpu()
